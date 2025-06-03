@@ -53,7 +53,7 @@ dependencies = [
 [project.optional-dependencies]
 plot = [ "matplotlib>=3" ]
 tb = [ "tbmodels>=1.1" ]
-
+hm = [ "mpi4py>=4.0", "elsipy"]
 [tool.poetry.group.dev.dependencies]
 sphinx = ">=5"
 sphinx-rtd-theme = ">=1.1.1"
