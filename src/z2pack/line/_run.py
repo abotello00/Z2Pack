@@ -8,6 +8,7 @@ import numpy as np
 from . import _LOGGER, EigenstateLineData, LineResult, OverlapLineData
 from .. import io
 from .._logging_tools import TagAdapter
+from .._mpi import _get_comm, _is_root
 from .._run_utils import _check_save_dir, _load_init_result, _log_run
 from ._control import LineControlContainer, _create_line_controls
 
@@ -36,6 +37,7 @@ def run_line(
     load=False,
     load_quiet=True,
     serializer="auto",
+    comm=None,
 ):
     r"""
     Calculates the Wannier charge centers for a given system and line, automatically converging w.r.t. the number of k-points along the line.
@@ -65,6 +67,9 @@ def run_line(
     :param serializer:  Serializer which is used to save the result to file. Valid options are ``msgpack``, :py:mod:`json` and :py:mod:`pickle`. By default (``serializer='auto'``), the serializer is inferred from the file ending. If this fails, ``msgpack`` is used.
     :type serializer:   module
 
+    :param comm:        MPI communicator (``mpi4py``) of a run on several processes: only its root process writes the log and the ``save_file``. Defaults to the system's own communicator (``system.comm``), if it has one. The k-points of the line are distributed by the system itself, see e.g. the ``parallel`` option of :class:`z2pack.hm.System`.
+    :type comm:         mpi4py.MPI.Comm
+
     :returns:   :class:`LineResult` instance.
 
     Example usage:
@@ -93,6 +98,8 @@ def run_line(
         valid_type=LineResult,
     )
     _check_save_dir(save_file=save_file)
+    if not _is_root(_get_comm(comm, system)):
+        save_file = None
 
     return _run_line_impl(
         *controls,

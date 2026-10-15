@@ -42,6 +42,15 @@ class System(EigenstateSystem):
 
     :param check_periodic: Evaluate the Hamiltonian at :math:`\{0, 1\}^d` as a simple check if it is periodic. Note that this does not work if the Hamiltonian is written such that the eigenstates acquire a phase when being translated by a lattice vector.
     :type check_periodic: bool
+
+    :param parallel: Set to ``"mpi"`` to distribute the k-points of each line over the processes of ``comm``. Every process must run the same Z2Pack script; all of them receive the full result. Requires ``mpi4py``. See :ref:`z2pack_tutorial_mpi`.
+    :type parallel: str
+
+    :param comm: MPI communicator used when ``parallel="mpi"``. Defaults to ``MPI.COMM_WORLD``.
+    :type comm: mpi4py.MPI.Comm
+
+    :param eigensolver: Library used to diagonalize the Hamiltonian at each k-point: ``"lapack"`` (``scipy.linalg.eigh``) or ``"elsi"`` (ELSI through ``elsipy``, single-process mode).
+    :type eigensolver: str
     """
 
     def __init__(
@@ -55,6 +64,9 @@ class System(EigenstateSystem):
         basis_overlap=None,
         convention=2,
         check_periodic=False,
+        parallel=None,
+        comm=None,
+        eigensolver="lapack",
     ):
         self._hamilton = hamilton
         self._hermitian_tol = hermitian_tol
@@ -110,7 +122,41 @@ class System(EigenstateSystem):
         else:
             self._bands = bands
 
-    def get_eig_serial(self, kpt):
+        if parallel not in {None, "mpi"}:
+            raise ValueError(
+                "Invalid value '{}' for 'parallel', must be either None or 'mpi'.".format(parallel)
+            )
+        self._parallel = parallel
+        if parallel == "mpi" and comm is None:
+            from mpi4py import MPI  # pylint: disable=import-outside-toplevel
+
+            comm = MPI.COMM_WORLD
+        self._comm = comm
+
+        if eigensolver not in {"lapack", "elsi"}:
+            raise ValueError(
+                "Invalid value '{}' for 'eigensolver', must be either 'lapack' or 'elsi'.".format(
+                    eigensolver
+                )
+            )
+        self._eigensolver = eigensolver
+        self._size = size
+        self._elsi_handle = None
+        self._elsi_unit_ovlp = None
+
+    @property
+    def comm(self):
+        """
+        MPI communicator over which the k-points of a line are distributed,
+        or ``None`` if the system is not parallelized.
+        """
+        return self._comm if self._parallel == "mpi" else None
+
+    @comm.setter
+    def comm(self, value):
+        self._comm = value
+
+    def get_eig(self, kpt):
         __doc__ = (  # pylint: disable=unused-variable,redefined-builtin
             super().__doc__  # pylint: disable=no-member
         )
@@ -118,51 +164,10 @@ class System(EigenstateSystem):
         k_points = kpt[:-1]
 
         # get eigenvectors corr. to the chosen bands
-        eigs = []
-        for i, k in enumerate(k_points):
-            ham = self._hamilton(k)
-            if self._hermitian_tol is not None:
-                diff = la.norm(ham - ham.conjugate().transpose(), ord=np.inf)
-                if diff > self._hermitian_tol:
-                    raise ValueError(
-                        "The Hamiltonian you used is not hermitian, with the maximum difference between the Hamiltonian and its adjoint being {}. Use the ``hamilton_tol`` input parameter (in the ``tb.Hamilton`` constructor; currently {}) to set the sensitivity of this test or turn it off completely (``hamilton_tol=None``).".format(
-                            diff, self._hermitian_tol
-                        )
-                    )
-            if not self._hamilton_orthogonal:
-                ovl = self._basis_overlap(k)
-                if self._hermitian_tol is not None:
-                    diff = la.norm(ovl - ovl.conjugate().transpose(), ord=np.inf)
-                    if diff > self._hermitian_tol:
-                        raise ValueError(
-                            "The overlap you used is not hermitian, with the maximum difference between the overlap matrix and its adjoint being {}. Use the ``hermitian_tol`` input parameter (currently {}) to set the sensitivity of this test or turn it off completely (``hermitian_tol=None``).".format(
-                                diff, self._hermitian_tol
-                            )
-                        )
-                ovl2 = la.inv(la.sqrtm(ovl))
-                ortho_ham = np.dot(ovl2, ham.dot(ovl2))
-                ham = ortho_ham
-
-            eigval, eigvec = la.eigh(ham)
-
-            phase = np.angle(eigvec[0, np.arange(eigvec.shape[1])])
-            phase_adjustment = np.exp(-1j * phase)
-            eigvec *= phase_adjustment
-
-
-            eigval = np.real(eigval)
-            idx = eigval.argsort()
-
-            idx = idx[self._bands]
-            idx.sort()
-            # take only the lower - energy eigenstates
-            eigvec = eigvec[:, idx]
-            if  i == 0 :
-                print(eigval[-5:])
-                #print(norms[-5:])
-            # cast to complex explicitly to avoid casting error when the phase
-            # is complex but the eigenvector itself is not.
-            eigs.append(np.array(eigvec, dtype=complex))
+        if self._parallel == "mpi":
+            eigs = self._get_eigvecs_mpi(k_points)
+        else:
+            eigs = [self._get_eigvecs(k) for k in k_points]
 
         for i, k in enumerate(kpt[:-1]):
             if self._convention == 2:
@@ -174,237 +179,93 @@ class System(EigenstateSystem):
         eigs.append(
             list(eigs[0] * np.exp(-2j * np.pi * np.dot(self._pos, kpt[-1] - kpt[0]))[None, :])
         )
-        print(np.array(eigs[0][:3])[:,-5:])
         return eigs
 
-    def get_eig_mpi(self, kpt):
-        __doc__ = (  # pylint: disable=unused-variable,redefined-builtin
-            super().__doc__  # pylint: disable=no-member
-        )
-        from elsipy import elsi
-        from mpi4py import MPI
-        # ==== MPI Setup ====
-        comm=MPI.COMM_WORLD
-        rank = comm.Get_rank()
-        size = comm.Get_size()
+    def _get_eigvecs_mpi(self, k_points):
+        """
+        Computes the eigenvectors for a contiguous chunk of ``k_points`` on
+        each process, and gathers the full list on all processes.
+        """
+        rank = self._comm.Get_rank()
+        size = self._comm.Get_size()
+        indices = np.array_split(np.arange(len(k_points)), size)[rank]
+        local_eigs = []
+        error = None
+        try:
+            local_eigs = [self._get_eigvecs(k_points[i]) for i in indices]
+        except Exception as exc:  # pylint: disable=broad-except
+            # re-raised on every process below, so that no process hangs
+            error = exc
+        gathered = self._comm.allgather((local_eigs, error))
+        for _, err in gathered:
+            if err is not None:
+                raise err
+        return [eig for chunk, _ in gathered for eig in chunk]
 
-        # ==== ELSI Setup ====
-        n_basis = len(self._hamilton([0,0,0]))
-        n_electrons = n_basis
-        elsi_h = elsi.elsi(parallel_mode=0,matrix_format=0,  n_basis=n_basis,n_electron=n_electrons,n_state=n_basis)
-        elsi_h.elsi_set_mpi(comm)
-        # create k-points for string
-        k_points = kpt[:-1]
-
-
-        # split to local k-points
-        k_points_local = np.array_split(k_points, size)[rank]
-        n_kpoints_local = len(k_points_local)
-        eigs_local = [] #np.empty((n_basis,n_basis,1), dtype = 'complex')
-
-        for i, k in enumerate(k_points_local):
-            ham = np.array(self._hamilton(k), dtype='complex128')
+    def _get_eigvecs(self, k):
+        """
+        Returns the eigenvectors (as columns) of the selected bands at ``k``.
+        """
+        ham = self._hamilton(k)
+        if self._hermitian_tol is not None:
+            diff = la.norm(ham - ham.conjugate().transpose(), ord=np.inf)
+            if diff > self._hermitian_tol:
+                raise ValueError(
+                    "The Hamiltonian you used is not hermitian, with the maximum difference between the Hamiltonian and its adjoint being {}. Use the ``hamilton_tol`` input parameter (in the ``tb.Hamilton`` constructor; currently {}) to set the sensitivity of this test or turn it off completely (``hamilton_tol=None``).".format(
+                        diff, self._hermitian_tol
+                    )
+                )
+        if not self._hamilton_orthogonal:
+            ovl = self._basis_overlap(k)
             if self._hermitian_tol is not None:
-                diff = la.norm(ham - ham.conjugate().transpose(), ord=np.inf)
+                diff = la.norm(ovl - ovl.conjugate().transpose(), ord=np.inf)
                 if diff > self._hermitian_tol:
                     raise ValueError(
-                        "The Hamiltonian you used is not hermitian, with the maximum difference between the Hamiltonian and its adjoint being {}. Use the ``hamilton_tol`` input parameter (in the ``tb.Hamilton`` constructor; currently {}) to set the sensitivity of this test or turn it off completely (``hamilton_tol=None``).".format(
+                        "The overlap you used is not hermitian, with the maximum difference between the overlap matrix and its adjoint being {}. Use the ``hermitian_tol`` input parameter (currently {}) to set the sensitivity of this test or turn it off completely (``hermitian_tol=None``).".format(
                             diff, self._hermitian_tol
                         )
                     )
-            ovl = np.identity(n_basis, dtype='complex')
-            elsi_h.elsi_set_unit_ovl(1)
-            if not self._hamilton_orthogonal:
-                ovl = np.array(self._basis_overlap(k), dtype='complex128')
-            #    if self._hermitian_tol is not None:
-            #        diff = la.norm(ovl - ovl.conjugate().transpose(), ord=np.inf)
-            #        if diff > self._hermitian_tol:
-            #            raise ValueError(
-            #                "The overlap you used is not hermitian, with the maximum difference between the overlap matrix and its adjoint being {}. Use the ``hermitian_tol`` input parameter (currently {}) to set the sensitivity of this test or turn it off completely (``hermitian_tol=None``).".format(
-            #                    diff, self._hermitian_tol
-            #                )
-            #            )
-                ovl2 = la.inv(la.sqrtm(ovl))
-                ortho_ham = np.dot(ovl2, ham.dot(ovl2))
-                ham = ortho_ham
-                ovl =  np.identity(n_basis, dtype='complex')
-                elsi_h.elsi_set_unit_ovl(1)
+            ovl2 = la.inv(la.sqrtm(ovl))
+            ortho_ham = np.dot(ovl2, ham.dot(ovl2))
+            ham = ortho_ham
 
-            eigval, eigvec =  elsi_h.elsi_ev_complex(ham,ovl)
-            eigvec = eigvec.T # fortran to python column arrangement
-            phase = np.angle(eigvec[0, np.arange(eigvec.shape[1])])
-            phase_adjustment = np.exp(-1j * phase)
-            eigvec *= phase_adjustment
+        eigval, eigvec = self._eigh(ham)
+        eigval = np.real(eigval)
+        idx = eigval.argsort()
 
-            eigval = np.real(eigval)
-            idx = eigval.argsort()
+        idx = idx[self._bands]
+        idx.sort()
+        # take only the lower - energy eigenstates
+        eigvec = eigvec[:, idx]
 
+        # cast to complex explicitly to avoid casting error when the phase
+        # is complex but the eigenvector itself is not.
+        return np.array(eigvec, dtype=complex)
 
+    def _eigh(self, ham):
+        if self._eigensolver == "elsi":
+            return self._elsi_eigh(ham)
+        return la.eigh(ham)
 
+    def _elsi_eigh(self, ham):
+        """
+        Diagonalizes ``ham`` with ELSI in single-process mode. The overlap is
+        always the identity, since non-orthogonal bases are already
+        orthogonalized before this is called.
+        """
+        if self._elsi_handle is None:
+            from elsipy import elsi  # pylint: disable=import-outside-toplevel
 
-            idx = idx[self._bands]
-            idx.sort()
-            # take only the lower - energy eigenstates
-
-            eigvec = eigvec[:, idx]
-            #if rank ==0 and  i == 0 :
-                #print(eigval[-5:])
-                #print(norms[-5:])
-
-            # cast to complex explicitly to avoid casting error when the phase
-            # is complex but the eigenvector itself is not.
-            eigs_local.append(np.array(eigvec, dtype='complex128'))
-
-
-        eigs=[]
-
-        # gather:
-        ## Send the results to the root process
-        if rank == 0 :
-            eigs = eigs_local
-            # Receive the results on the root process
-            for i in range(1, size):
-                #start = i * n_kpoints_local
-                #end = start + n_kpoints_local
-                loc = comm.recv(source=i, tag=11)
-                for l in loc:
-                    eigs.append(l)
-        else:
-            comm.send(eigs_local, dest=0, tag=11)
-
-        comm.Barrier()
-
-        eigs = comm.bcast(eigs, root=0)
-
-        for i, k in enumerate(kpt[:-1]):
-            if self._convention == 2:
-                # normalize phases to get u instead of phi
-                eigs[i] *= np.exp(-2j * np.pi * np.dot(self._pos, k))[:, None]
-            eigs[i]  = list(eigs[i].T)
-
-        # The last bloch state is the same as the first up to a phase factor
-        eigs.append(
-            list(eigs[0] * np.exp(-2j * np.pi * np.dot(self._pos, kpt[-1] - kpt[0]))[None, :]
-        ))
-
-        #if rank == 0 :
-            #print(np.array(eigs[0][:3])[:,-5:])
-        return eigs
-
-    def get_eig_mpi_par_orb(self, kpt):
-        __doc__ = (  # pylint: disable=unused-variable,redefined-builtin
-            super().__doc__  # pylint: disable=no-member
-        )
-        from elsipy import elsi,blacs
-        from mpi4py import MPI
-        # ==== MPI Setup ====
-
-        comm=MPI.COMM_WORLD
-        rank = comm.Get_rank()
-        size = comm.Get_size()
-
-        npcol = 8
-        nprow = size//npcol
-        if nprow == 0:
-            nprow = 1
-        blacsctxt=blacs.sys2blacs_handle(comm)
-        blacs.gridinit(blacsctxt,nprow,npcol)
-
-
-        # ==== ELSI Setup ====
-        n_basis = len(self._hamilton([0,0,0]))
-        n_electrons = n_basis
-
-        elsi_h = elsi.elsi(parallel_mode=1,matrix_format=0,  n_basis=n_basis,n_electron=n_electrons,n_state=n_basis)
-        elsi_h.elsi_set_mpi(comm)
-        elsi_h.elsi_set_blacs(blacsctxt,8)
-        #elsi_h.elsi_set_mpi_global(comm)
-
-        # create k-points for string
-        k_points = kpt[:-1]
-
-
-        # split to local k-points
-        #k_points_local = np.array_split(k_points, size)[rank]
-        #n_kpoints_local = len(k_points_local)
-        eigs= [] #np.empty((n_basis,n_basis,1), dtype = 'complex')
-
-        for i, k in enumerate(k_points):
-            ham = np.array(self._hamilton(k), dtype='complex128')
-            if self._hermitian_tol is not None:
-                diff = la.norm(ham - ham.conjugate().transpose(), ord=np.inf)
-                if diff > self._hermitian_tol:
-                    raise ValueError(
-                        "The Hamiltonian you used is not hermitian, with the maximum difference between the Hamiltonian and its adjoint being {}. Use the ``hamilton_tol`` input parameter (in the ``tb.Hamilton`` constructor; currently {}) to set the sensitivity of this test or turn it off completely (``hamilton_tol=None``).".format(
-                            diff, self._hermitian_tol
-                        )
-                    )
-            ovl = np.identity(n_basis, dtype='complex')
-            elsi_h.elsi_set_unit_ovl(1)
-            if not self._hamilton_orthogonal:
-                ovl = np.array(self._basis_overlap(k), dtype='complex128')
-            #    if self._hermitian_tol is not None:
-            #        diff = la.norm(ovl - ovl.conjugate().transpose(), ord=np.inf)
-            #        if diff > self._hermitian_tol:
-            #            raise ValueError(
-            #                "The overlap you used is not hermitian, with the maximum difference between the overlap matrix and its adjoint being {}. Use the ``hermitian_tol`` input parameter (currently {}) to set the sensitivity of this test or turn it off completely (``hermitian_tol=None``).".format(
-            #                    diff, self._hermitian_tol
-            #                )
-            #            )
-                ovl2 = la.inv(la.sqrtm(ovl))
-                ortho_ham = np.dot(ovl2, ham.dot(ovl2))
-                ham = ortho_ham
-                ovl =  np.identity(n_basis, dtype='complex')
-                elsi_h.elsi_set_unit_ovl(1)
-
-            eigval, eigvec =  elsi_h.elsi_ev_complex(ham,ovl)
-            comm.barrier()
-            eigvec = eigvec.T # fortran to python column arrangement
-            phase = np.angle(eigvec[0, np.arange(eigvec.shape[1])])
-            phase_adjustment = np.exp(-1j * phase)
-            eigvec *= phase_adjustment
-
-            eigval = np.real(eigval)
-            idx = eigval.argsort()
-
-            idx = idx[self._bands]
-            idx.sort()
-            # take only the lower - energy eigenstates
-
-            eigvec = eigvec[:, idx]
-            if rank ==0 and  i == 0 :
-                print(eigval[-5:])
-                #print(norms[-5:])
-
-            # cast to complex explicitly to avoid casting error when the phase
-            # is complex but the eigenvector itself is not.
-            eigs.append(np.array(eigvec, dtype='complex128'))
-
-
-
-
-        for i, k in enumerate(kpt[:-1]):
-            if self._convention == 2:
-                # normalize phases to get u instead of phi
-                eigs[i] *= np.exp(-2j * np.pi * np.dot(self._pos, k))[:, None]
-            eigs[i]  = list(eigs[i].T)
-
-        # The last bloch state is the same as the first up to a phase factor
-        eigs.append(
-            list(eigs[0] * np.exp(-2j * np.pi * np.dot(self._pos, kpt[-1] - kpt[0]))[None, :]
-        ))
-
-        if rank == 0 :
-            print(np.array(eigs[0][:3])[:,-5:])
-        return eigs
-
-    def get_eig(self, kpt, mode='serial'):
-        if mode=='serial':
-            return self.get_eig_serial(kpt)
-        elif mode == 'mpi':
-            return self.get_eig_mpi(kpt)
-        elif mode == 'mpi_par_orb':
-            return self.get_eig_mpi_par_orb(kpt)
-        else:
-            print('Invalid mode option, defaulting to serial mode')
-            return self.get_eig_serial(kpt)
+            self._elsi_handle = elsi.elsi(
+                parallel_mode=0,
+                matrix_format=0,
+                n_basis=self._size,
+                n_electron=float(self._size),
+                n_state=self._size,
+            )
+            self._elsi_handle.elsi_set_unit_ovlp(1)
+            self._elsi_unit_ovlp = np.eye(self._size, dtype=complex, order="F")
+        # ELSI is Fortran: the matrix must be column-major, and it may be
+        # overwritten, so always pass a fresh copy.
+        ham = np.array(ham, dtype=complex, order="F", copy=True)
+        return self._elsi_handle.elsi_ev_complex(ham, self._elsi_unit_ovlp)

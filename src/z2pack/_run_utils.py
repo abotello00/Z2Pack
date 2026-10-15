@@ -7,6 +7,8 @@ import time
 
 from decorator import decorator
 
+from ._mpi import _get_comm, _root_only_logging
+
 __all__ = []
 
 
@@ -16,18 +18,36 @@ def _log_run(logger):
     """
 
     def inner(fct, **kwargs):
-        logger.info(kwargs, tags=("setup", "box", "skip"))
-        start_time = time.time()
+        # with MPI, only the root process writes the log
+        comm = _get_comm(kwargs.get("comm"), kwargs.get("system"))
+        with _root_only_logging(comm):
+            logger.info(_setup_log_kwargs(kwargs, comm), tags=("setup", "box", "skip"))
+            start_time = time.time()
 
-        result = fct(**kwargs)
+            result = fct(**kwargs)
 
-        end_time = time.time()
-        logger.info(end_time - start_time, tags=("box", "skip-before", "timing"))
-        logger.info(result.convergence_report, tags=("convergence_report", "box"))
+            end_time = time.time()
+            logger.info(end_time - start_time, tags=("box", "skip-before", "timing"))
+            logger.info(result.convergence_report, tags=("convergence_report", "box"))
 
         return result
 
     return decorator(inner)
+
+
+def _setup_log_kwargs(kwargs, comm):
+    """
+    Returns the inputs shown in the log. The MPI options only appear in an
+    MPI run, with the communicator shown as its number of processes.
+    """
+    kwargs = {
+        key: val
+        for key, val in kwargs.items()
+        if key not in ("comm", "line_groups") or val is not None
+    }
+    if comm is not None:
+        kwargs["comm"] = f"{comm.Get_size()} MPI processes"
+    return kwargs
 
 
 def _load_init_result(*, init_result, save_file, load, load_quiet, serializer, valid_type):

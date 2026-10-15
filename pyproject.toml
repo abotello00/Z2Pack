@@ -53,7 +53,10 @@ dependencies = [
 [project.optional-dependencies]
 plot = [ "matplotlib>=3" ]
 tb = [ "tbmodels>=1.1" ]
-hm = [ "mpi4py>=4.0", "elsipy"]
+# The "elsi" eigensolver of z2pack.hm.System also needs elsipy, which is not on
+# PyPI: build it from elsi_interface/test/python/elsipy.
+mpi = [ "mpi4py>=4.0" ]
+
 [tool.poetry.group.dev.dependencies]
 sphinx = ">=5"
 sphinx-rtd-theme = ">=1.1.1"

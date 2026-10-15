@@ -17,3 +17,4 @@ If you've used a previous version of Z2Pack, you should probably read the :ref:`
     surface.rst
     invariants.rst
     plot.rst
+    mpi.rst

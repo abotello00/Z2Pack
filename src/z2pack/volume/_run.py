@@ -9,6 +9,7 @@ import numpy as np
 from . import _LOGGER, VolumeData, VolumeResult
 from .._async_handler import AsyncHandler
 from .._logging_tools import TagAdapter, TagFilter, filter_manager
+from .._mpi import _get_comm, _is_root
 from .._run_utils import _check_save_dir, _load_init_result, _log_run
 from ._control import VolumeControlContainer, _create_volume_controls
 
@@ -37,6 +38,8 @@ def run_volume(
     load=False,
     load_quiet=True,
     serializer="auto",
+    comm=None,
+    line_groups=None,
 ):
     r"""
     Calculates the Wannier charge centers for a given system and volume.
@@ -86,6 +89,12 @@ def run_volume(
     :param serializer:  Serializer which is used to save the result to file. Valid options are ``msgpack``, :py:mod:`json` and :py:mod:`pickle`. By default (``serializer='auto'``), the serializer is inferred from the file ending. If this fails, :py:mod:`json` is used.
     :type serializer:   module
 
+    :param comm:        MPI communicator (``mpi4py``) for running on several processes. Only the root process writes the log and the ``save_file``. The surfaces are computed one after the other; the lines within each surface are distributed as in :func:`z2pack.surface.run`. Defaults to the system's own communicator (``system.comm``), if it has one.
+    :type comm:         mpi4py.MPI.Comm
+
+    :param line_groups: Number of groups of MPI processes which compute different lines, see :func:`z2pack.surface.run`.
+    :type line_groups:  int
+
     :returns:   :class:`VolumeResult` instance.
 
     Example usage:
@@ -122,9 +131,11 @@ def run_volume(
         num_lines=num_lines,
         num_surfaces=num_surfaces,
         min_neighbour_dist=min_neighbour_dist,
-        save_file=save_file,
+        save_file=save_file if _is_root(_get_comm(comm, system)) else None,
         init_result=init_result,
         serializer=serializer,
+        comm=comm,
+        line_groups=line_groups,
     )
 
 
@@ -140,6 +151,8 @@ def _run_volume_impl(  # pylint: disable=too-many-locals
     save_file=None,
     init_result=None,
     serializer="auto",
+    comm=None,
+    line_groups=None,
 ):
     r"""Implementation of the volume's run.
 
@@ -163,6 +176,8 @@ def _run_volume_impl(  # pylint: disable=too-many-locals
             num_lines=num_lines,
             min_neighbour_dist=min_neighbour_dist,
             init_result=init_surface_result,
+            comm=comm,
+            line_groups=line_groups,
         )
 
     # setting up async handler

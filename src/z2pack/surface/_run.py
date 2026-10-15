@@ -10,6 +10,7 @@ from . import _LOGGER, SurfaceData, SurfaceResult
 from .. import io
 from .._async_handler import AsyncHandler
 from .._logging_tools import TagAdapter, TagFilter, filter_manager
+from .._mpi import _get_comm, _is_root, _LineGroups
 from .._run_utils import _check_save_dir, _load_init_result, _log_run
 from ..line import _run as _line_run
 from ._control import SurfaceControlContainer, _create_surface_controls
@@ -43,6 +44,8 @@ def run_surface(
     load=False,
     load_quiet=True,
     serializer="auto",
+    comm=None,
+    line_groups=None,
 ):
     r"""
     Calculates the Wannier charge centers for a given system and surface.
@@ -89,6 +92,12 @@ def run_surface(
     :param serializer:  Serializer which is used to save the result to file. Valid options are ``msgpack``, :py:mod:`json` and :py:mod:`pickle`. By default (``serializer='auto'``), the serializer is inferred from the file ending. If this fails, :py:mod:`json` is used.
     :type serializer:   module
 
+    :param comm:        MPI communicator (``mpi4py``) for running on several processes. All processes must call this function with the same arguments, and all of them return the full result; only the root process writes the log and the ``save_file``. Defaults to the system's own communicator (``system.comm``), if it has one.
+    :type comm:         mpi4py.MPI.Comm
+
+    :param line_groups: Number of groups the processes of ``comm`` are split into. Each group computes different lines; within a group, a system with its own MPI parallelization (``system.comm``) distributes the k-points of a line. By default, this is ``1`` (all processes compute each line together) if the system has its own communicator, and the number of processes (one line per process) otherwise. See :ref:`z2pack_tutorial_mpi`.
+    :type line_groups:  int
+
     :returns:   :class:`SurfaceResult` instance.
 
     Example usage:
@@ -128,6 +137,8 @@ def run_surface(
         save_file=save_file,
         init_result=init_result,
         serializer=serializer,
+        comm=comm,
+        line_groups=line_groups,
     )
 
 
@@ -142,6 +153,8 @@ def _run_surface_impl(  # pylint: disable=too-many-locals
     save_file=None,
     init_result=None,
     serializer="auto",
+    comm=None,
+    line_groups=None,
 ):
     r"""Implementation of the surface's run.
 
@@ -153,6 +166,45 @@ def _run_surface_impl(  # pylint: disable=too-many-locals
 
     # CONTROL SETUP
     ctrl_container = SurfaceControlContainer(controls)
+
+    # MPI SETUP -- lines are distributed over groups of processes
+    comm = _get_comm(comm, system)
+    groups = _LineGroups(comm, line_groups, system)
+    if not _is_root(comm):
+        save_file = None
+    try:
+        return _run_surface_loop(
+            ctrl_container,
+            groups,
+            system=system,
+            surface=surface,
+            num_lines=num_lines,
+            min_neighbour_dist=min_neighbour_dist,
+            save_file=save_file,
+            init_result=init_result,
+            serializer=serializer,
+        )
+    finally:
+        groups.free()
+
+
+def _run_surface_loop(  # pylint: disable=too-many-locals,too-many-statements
+    ctrl_container,
+    groups,
+    *,
+    system,
+    surface,
+    num_lines,
+    min_neighbour_dist,
+    save_file,
+    init_result,
+    serializer,
+):
+    """
+    Main loop of the surface's run. Lines which are added at the same time
+    (initial lines, and the new lines of each refinement step) are independent
+    of each other, and are computed in parallel by the ``groups``.
+    """
 
     # HELPER FUNCTIONS
     def get_line(t, init_line_result=None):
@@ -179,24 +231,37 @@ def _run_surface_impl(  # pylint: disable=too-many-locals
 
     with AsyncHandler(handler) as save_thread:
 
-        def add_line(t):
+        def add_lines(t_values):
             """
-            Adds a line to the Surface, if it is within min_neighbour_dist of
-            the given lines.
+            Adds lines to the Surface, except those which are within
+            min_neighbour_dist of the existing lines (or of a line added
+            before them).
             """
-            # find whether the line is allowed still
-            dist = data.nearest_neighbour_dist(t)
-            if dist < min_neighbour_dist:
-                if dist == 0:
-                    _LOGGER.info(f"Line at t = {t} exists already.")
+            # find which lines are allowed still
+            accepted = []
+            for t in t_values:
+                dist = min([data.nearest_neighbour_dist(t)] + [abs(t - t2) for t2 in accepted])
+                if dist < min_neighbour_dist:
+                    if dist == 0:
+                        _LOGGER.info(f"Line at t = {t} exists already.")
+                    else:
+                        _LOGGER.warning(f"'min_neighbour_dist' reached: cannot add line at t = {t}")
                 else:
-                    _LOGGER.warning(f"'min_neighbour_dist' reached: cannot add line at t = {t}")
-                return SurfaceResult(data, ctrl_container.stateful, ctrl_container.convergence)
+                    accepted.append(t)
 
-            _LOGGER.info(f"Adding line at t = {t}")
-            data.add_line(t, get_line(t))
-
-            return update_result()
+            if groups.comm is None:
+                for t in accepted:
+                    _LOGGER.info(f"Adding line at t = {t}")
+                    data.add_line(t, get_line(t))
+                    update_result()
+            else:
+                _LOGGER.info(
+                    f"Calculating {len(accepted)} lines on {groups.num_groups} group(s) of MPI processes."
+                )
+                for t, line_result in zip(accepted, groups.map(get_line, accepted)):
+                    _LOGGER.info(f"Adding line at t = {t}")
+                    data.add_line(t, line_result)
+                    update_result()
 
         def update_result():
             """
@@ -240,10 +305,19 @@ def _run_surface_impl(  # pylint: disable=too-many-locals
 
             # re-run lines with existing result as input
             _LOGGER.info("Re-running existing lines.")
-            for line in data.lines:
-                _LOGGER.info(f"Re-running line for t = {line.t}")
-                line.result = get_line(line.t, line.result)
-                update_result()
+            if groups.comm is None:
+                for line in data.lines:
+                    _LOGGER.info(f"Re-running line for t = {line.t}")
+                    line.result = get_line(line.t, line.result)
+                    update_result()
+            else:
+                new_results = groups.map(
+                    lambda line: get_line(line.t, line.result), list(data.lines)
+                )
+                for line, line_result in zip(data.lines, new_results):
+                    _LOGGER.info(f"Re-running line for t = {line.t}")
+                    line.result = line_result
+                    update_result()
 
         else:
             data = SurfaceData()
@@ -251,8 +325,7 @@ def _run_surface_impl(  # pylint: disable=too-many-locals
         # STEP 2 -- PRODUCE REQUIRED STRINGS
         # create lines required by num_lines
         _LOGGER.info("Adding lines required by 'num_lines'.")
-        for t in np.linspace(0, 1, num_lines):
-            result = add_line(t)
+        add_lines(np.linspace(0, 1, num_lines))
 
         # STEP 3 -- MAIN LOOP
         num_lines = len(data.lines)
@@ -260,8 +333,7 @@ def _run_surface_impl(  # pylint: disable=too-many-locals
         while not all(conv):
             # add lines for all non-converged values
             new_t = [(t1 + t2) / 2 for (t1, t2), c in zip(zip(data.t, data.t[1:]), conv) if not c]
-            for t in new_t:
-                result = add_line(t)
+            add_lines(new_t)
 
             # check if new lines appeared
             num_lines_new = len(data.lines)
@@ -270,4 +342,4 @@ def _run_surface_impl(  # pylint: disable=too-many-locals
             num_lines = num_lines_new
             conv = collect_convergence()
 
-    return result
+    return SurfaceResult(data, ctrl_container.stateful, ctrl_container.convergence)
